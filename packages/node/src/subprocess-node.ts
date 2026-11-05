@@ -285,7 +285,10 @@ export class NodeSubprocessRuntime extends SubprocessRuntime {
       () => undefined,
     )
 
-    const collected: SubprocessCollectedOutputs = {}
+    const collected: {
+      -readonly [K in keyof SubprocessCollectedOutputs]:
+        SubprocessCollectedOutputs[K]
+    } = {}    
     const syncs = new Map<'stdout' | 'stderr', () => Promise<void>>()
     // The pid is not known until the node answers, but collect-mode readers
     // must exist at return time, so `sync` closes over this box and the pid
