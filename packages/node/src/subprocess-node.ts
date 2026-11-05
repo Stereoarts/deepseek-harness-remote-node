@@ -286,8 +286,27 @@ export class NodeSubprocessRuntime extends SubprocessRuntime {
     )
 
     const collected: SubprocessCollectedOutputs = {}
-    const readers = new Map<'stdout' | 'stderr', SubprocessOutputReader>()
     const syncs = new Map<'stdout' | 'stderr', () => Promise<void>>()
+    // The pid is not known until the node answers, but collect-mode readers
+    // must exist at return time, so `sync` closes over this box and the pid
+    // is filled in once `started` resolves.
+    const pidBox: { value: number } = { value: -1 }
+
+    // Collect-mode readers are installed SYNCHRONOUSLY, before the handle is
+    // returned. The seam's callers — `dsh-bash-local` among them — read
+    // `handle.collected` immediately after `spawn`, and the local backend
+    // provides its readers at return time, so a caller cannot tell which
+    // machine ran the process. Populating them only once the node answered
+    // made every collected spawn fail with "subprocess implementation dropped
+    // a requested collect stream". 'pipe' and 'inherit' are not collected:
+    // 'pipe' is handed over raw further down, and 'inherit' was already
+    // refused by `toNodeOutputMode`.
+    for (const which of ['stdout', 'stderr'] as const) {
+      if (typeof spec.stdio[which] !== 'object') continue
+      const { reader, sync } = this.readerFor(which, pidBox)
+      collected[which] = reader
+      syncs.set(which, sync)
+    }
 
     // A pipe-mode stream is handed to the caller raw, so it is a real Readable
     // fed by the node's payload frames and ended when the process exits.
@@ -374,18 +393,13 @@ export class NodeSubprocessRuntime extends SubprocessRuntime {
       },
     }
 
-    // The handle's pid and collected readers become known only once the node
-    // answers. They are filled in here rather than being part of the object
-    // literal because the seam reads `pid` synchronously and the wire is not.
+    // The handle's pid becomes known only once the node answers; it is filled
+    // in here rather than in the object literal because the seam reads `pid`
+    // synchronously and the wire is not. The collect readers themselves were
+    // installed synchronously above and needed only this pid.
     void started.then((result) => {
+      pidBox.value = result.pid
       Object.defineProperty(handle, 'pid', { value: result.pid, enumerable: true, configurable: true })
-      for (const which of ['stdout', 'stderr'] as const) {
-        if (!result.collected[which]) continue
-        const { reader, sync } = this.readerFor(which, result.pid)
-        readers.set(which, reader)
-        syncs.set(which, sync)
-      }
-      Object.assign(collected, Object.fromEntries(readers))
     }).catch(() => {})
 
     void settled
@@ -409,12 +423,13 @@ export class NodeSubprocessRuntime extends SubprocessRuntime {
    * The mirror is only ever a PREFIX of the node's window, so an answer is never
    * wrong, only possibly stale.
    * @param which - the stream to read.
-   * @param pid - the process that produced it.
+   * @param pid - box holding the process id; filled in once the node answers,
+   *   so a sync issued before that observes a failed read and stays empty.
    * @returns the seam's reader and a `sync` the handle awaits before settling.
    */
   private readerFor(
     which: 'stdout' | 'stderr',
-    pid: number,
+    pid: { readonly value: number },
   ): { reader: SubprocessOutputReader; sync: () => Promise<void> } {
     let text = ''
     let nextOffset = 0
@@ -427,7 +442,7 @@ export class NodeSubprocessRuntime extends SubprocessRuntime {
       // reads would interleave their deltas out of order.
       if (inFlight) return inFlight
       const run = this.registry
-        .invoke<NodeOutputRead>('proc.read', { pid, stream: which, fromByte: nextOffset })
+        .invoke<NodeOutputRead>('proc.read', { pid: pid.value, stream: which, fromByte: nextOffset })
         .then((read) => {
           text += read.text
           nextOffset = read.nextOffset
